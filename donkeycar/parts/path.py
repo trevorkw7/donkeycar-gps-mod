@@ -1,3 +1,19 @@
+#!/usr/bin/env python3
+"""
+path.py
+
+This module contains various classes for recording, saving, and using a
+path for a Donkey Car. In particular, the CTE class has been modified to use
+a sequential approach when following a recorded path. The modifications
+include:
+  - Keeping track of a last (largest) waypoint index so that only future points are
+    considered in the cross-track error computation.
+  - When the vehicle nears the origin (within a configurable threshold), the index is reset.
+  
+All changes to support sequential path following and robust wrap–around
+are marked with comments.
+"""
+
 import pickle
 import math
 import logging
@@ -8,10 +24,13 @@ from PIL import Image, ImageDraw
 from donkeycar.parts.transform import PIDController
 from donkeycar.utils import norm_deg, dist, deg2rad, arr_to_img, is_number_type
 
+# ------------------------------
+# Path Recording Classes
+# ------------------------------
 
 class AbstractPath:
     def __init__(self, min_dist=1.):
-        self.path = []  # list of (x,y) tuples
+        self.path = []  # list of (x, y) tuples
         self.min_dist = min_dist
         self.x = math.inf
         self.y = math.inf
@@ -77,6 +96,7 @@ class CsvPath(AbstractPath):
 
         self.recording = False
 
+
 class CsvThrottlePath(AbstractPath):
     def __init__(self, min_dist: float = 1.0) -> None:
         super().__init__(min_dist)
@@ -124,7 +144,7 @@ class CsvThrottlePath(AbstractPath):
 
 class RosPath(AbstractPath):
     def __init__(self, min_dist=1.):
-        super().__init__(self, min_dist)
+        super().__init__(min_dist)  # CHANGED: Fixed incorrect superclass call
 
     def save(self, filename):
         outfile = open(filename, 'wb')
@@ -137,6 +157,10 @@ class RosPath(AbstractPath):
         self.recording = False
         return True
 
+# ------------------------------
+# Image and Origin Helpers
+# ------------------------------
+
 class PImage(object):
     def __init__(self, resolution=(500, 500), color="white", clear_each_frame=False):
         self.resolution = resolution
@@ -147,7 +171,6 @@ class PImage(object):
     def run(self):
         if self.clear_each_frame:
             self.img = Image.new('RGB', self.resolution, color=self.color)
-
         return self.img
 
 
@@ -155,7 +178,6 @@ class OriginOffset(object):
     '''
     Use this to set the car back to the origin without restarting it.
     '''
-
     def __init__(self, debug=False):
         self.debug = debug
         self.ox = 0.0
@@ -166,13 +188,11 @@ class OriginOffset(object):
 
     def run(self, x, y, closest_pt):
         """
-        :param x: is current horizontal position
-        :param y: is current vertical position
-        :param closest_pt: is current cte/closest_pt
-        :return: translated x, y and new index of closest point in path.
+        Translate the current position by the stored origin.
+        If a reset is requested, the origin is updated with the current position.
         """
         if is_number_type(x) and is_number_type(y):
-            # if origin is None, set it to current position
+            # If reset flag is set, update origin to current position.
             if self.reset:
                 self.ox = x
                 self.oy = y
@@ -182,20 +202,20 @@ class OriginOffset(object):
         else:
             logging.debug("OriginOffset ignoring non-number")
 
-        # translate the given position by the origin
+        # Compute translated position.
         pos = (0, 0)
         if self.last_x is not None and self.last_y is not None and self.ox is not None and self.oy is not None:
             pos = (self.last_x - self.ox, self.last_y - self.oy)
         if self.debug:
             logging.info(f"pos/x = {pos[0]}, pos/y = {pos[1]}")
 
-        # reset the starting search index for cte algorithm
+        # If resetting, clear the starting search index for CTE algorithm.
         if self.reset:
             if self.debug:
                 logging.info(f"cte/closest_pt = {closest_pt} -> None")
             closest_pt = None
 
-        # clear reset latch
+        # Clear the reset flag.
         self.reset = False
 
         return pos[0], pos[1], closest_pt
@@ -207,7 +227,7 @@ class OriginOffset(object):
 
     def reset_origin(self):
         """
-        Reset the origin with the next value that comes in
+        Reset the origin with the next incoming value.
         """
         self.ox = None
         self.oy = None
@@ -216,24 +236,25 @@ class OriginOffset(object):
     def init_to_last(self):
         self.set_origin(self.last_x, self.last_y)
 
+# ------------------------------
+# Plotting Helpers
+# ------------------------------
 
 class PathPlot(object):
     '''
-    draw a path plot to an image
+    Draw a path on an image.
     '''
     def __init__(self, scale=1.0, offset=(0., 0.0)):
         self.scale = scale
         self.offset = offset
 
     def plot_line(self, sx, sy, ex, ey, draw, color):
-        '''
-        scale dist so that max_dist is edge of img (mm)
-        and img is PIL Image, draw the line using the draw ImageDraw object
-        '''
-        draw.line((sx,sy, ex, ey), fill=color, width=1)
+        """
+        Draw a line between two points on the image.
+        """
+        draw.line((sx, sy, ex, ey), fill=color, width=1)
 
     def run(self, img, path):
-        
         if type(img) is numpy.ndarray:
             stacked_img = numpy.stack((img,)*3, axis=-1)
             img = arr_to_img(stacked_img)
@@ -244,202 +265,167 @@ class PathPlot(object):
             for iP in range(0, len(path) - 1):
                 ax, ay = path[iP]
                 bx, by = path[iP + 1]
-
-                #
-                # y increases going north, so handle this with scale
-                #
+                # Note: y increases going north (thus inverted scaling).
                 self.plot_line(ax * self.scale + self.offset[0],
-                            ay * -self.scale + self.offset[1],
-                            bx * self.scale + self.offset[0],
-                            by * -self.scale + self.offset[1],
-                            draw,
-                            color)
+                               ay * -self.scale + self.offset[1],
+                               bx * self.scale + self.offset[0],
+                               by * -self.scale + self.offset[1],
+                               draw,
+                               color)
         return img
 
 
 class PlotCircle(object):
     '''
-    draw a circle plot to an image
+    Draw a circle on an image.
     '''
-    def __init__(self,  scale=1.0, offset=(0., 0.0), radius=4, color = (0, 255, 0)):
+    def __init__(self, scale=1.0, offset=(0., 0.0), radius=4, color=(0, 255, 0)):
         self.scale = scale
         self.offset = offset
         self.radius = radius
         self.color = color
 
     def plot_circle(self, x, y, rad, draw, color, width=1):
-        '''
-        scale dist so that max_dist is edge of img (mm)
-        and img is PIL Image, draw the circle using the draw ImageDraw object
-        '''
+        """
+        Draw an ellipse (circle) at the specified position.
+        """
         sx = x - rad
         sy = y - rad
         ex = x + rad
         ey = y + rad
-
         draw.ellipse([(sx, sy), (ex, ey)], fill=color)
-
 
     def run(self, img, x, y):
         draw = ImageDraw.Draw(img)
         self.plot_circle(x * self.scale + self.offset[0],
-                        y * -self.scale + self.offset[1],  # y increases going north
-                        self.radius,
-                        draw, 
-                        self.color)
-
+                         y * -self.scale + self.offset[1],  # Note: y is inverted.
+                         self.radius,
+                         draw, 
+                         self.color)
         return img
+
+# ------------------------------
+# Modified CTE (Cross Track Error) Class
+# ------------------------------
+# CHANGED: The CTE class below has been modified to enforce sequential
+# waypoint following by keeping track of the last index (self.last_index)
+# and applying a wrap–around threshold (self.wrap_threshold) so that only points
+# with increasing sequence numbers are considered until the vehicle nears the origin.
 
 from donkeycar.la import Line3D, Vec3
 
 class CTE(object):
 
-    def __init__(self, look_ahead=1, look_behind=1, num_pts=None) -> None:
+    def __init__(self, look_ahead=1, look_behind=1, num_pts=None, wrap_threshold=2.0) -> None:
         self.num_pts = num_pts
         self.look_ahead = look_ahead
         self.look_behind = look_behind
+        # NEW: Track the last visited index to enforce sequential progression.
+        self.last_index = 0  
+        # NEW: Set the wrap threshold distance (in same units as GPS)
+        self.wrap_threshold = wrap_threshold  
 
-    #
-    # Find the index of the path element with minimal distance to (x,y).
-    # This prefers the first element with the minimum distance if there
-    # are more then one.
-    #
-    def nearest_pt(self, path, x, y, from_pt=0, num_pts=None):
-        from_pt = from_pt if from_pt is not None else 0
-        num_pts = num_pts if num_pts is not None else len(path)
-        num_pts = min(num_pts, len(path))
+    def nearest_pt(self, path, x, y, from_pt=None, num_pts=None):
+        """
+        CHANGED: Modified to only consider waypoints starting from the last_index.
+        When the search reaches the end, if the vehicle is close enough to the origin
+        (within wrap_threshold), the index is wrapped to 0.
+        """
+        # Use last_index if from_pt is not provided.
+        if from_pt is None:
+            from_pt = self.last_index
+        if num_pts is None:
+            num_pts = len(path) - from_pt  # only consider remaining points
+
         if num_pts < 0:
             logging.error("num_pts must not be negative.")
             return None, None, None
 
         min_pt = None
-        min_dist = None
-        min_index = None
-        for j in range(num_pts):
-            i = (j + from_pt) % len(path)
+        min_dist = float('inf')
+        min_index = from_pt
+
+        # Only iterate over indices from last_index onward.
+        for i in range(from_pt, len(path)):
             p = path[i]
             d = dist(p[0], p[1], x, y)
-            if min_dist is None or d < min_dist:
+            if d < min_dist:
                 min_pt = p
                 min_dist = d
                 min_index = i
+
+        # If we are at the last point, check whether we should wrap around.
+        if min_index == len(path) - 1:
+            origin_dist = dist(path[0][0], path[0][1], x, y)
+            if origin_dist < self.wrap_threshold:
+                logging.info(f"Wrapping around: distance to origin {origin_dist:.2f} < threshold {self.wrap_threshold}")
+                min_index = 0
+
+        self.last_index = min_index  # update the sequential progress
         return min_pt, min_index, min_dist
 
-
-    # TODO: update so that we look for nearest two points starting from a given point
-    #       and up to a given number of points.  This will speed things up
-    #       but more importantly it can be used to handle crossing paths.
-    def nearest_two_pts(self, path, x, y):
-        if path is None or len(path) < 2:
-            logging.error("path is none; cannot calculate nearest points")
-            return None, None
-
-        distances = []
-        for iP, p in enumerate(path):
-            d = dist(p[0], p[1], x, y)
-            distances.append((d, iP, p))
-        distances.sort(key=lambda elem : elem[0])
-
-        # get the prior point as start of segment
-        iA = (distances[0][1] - 1) % len(path)
-        a = path[iA]
-
-        # get the next point in the path as the end of the segment
-        iB = (iA + 2) % len(path)
-        b = path[iB]
-        
-        return a, b
-
-    def nearest_waypoints(self, path, x, y, look_ahead=1, look_behind=1, from_pt=0, num_pts=None):
+    def nearest_waypoints(self, path, x, y, look_ahead=None, look_behind=None, from_pt=None, num_pts=None):
         """
-        Get the path elements around the closest element to the given (x,y)
-        :param path: list of (x,y) points
-        :param x: horizontal coordinate of point to check
-        :param y: vertical coordinate of point to check
-        :param from_pt: index start start search within path
-        :param num_pts: maximum number of points to search in path
-        :param look_ahead: number waypoints to include ahead of nearest point.
-        :param look_behind: number of waypoints to include behind nearest point.
-        :return: index of first point, nearest point and last point in nearest path segments
+        CHANGED: Use the new nearest_pt method and then select sequential neighbors.
         """
-        if path is None or len(path) < 2:
-            logging.error("path is none; cannot calculate nearest points")
-            return None, None, None
+        if look_ahead is None:
+            look_ahead = self.look_ahead
+        if look_behind is None:
+            look_behind = self.look_behind
 
-        if look_ahead < 0:
-            logging.error("look_ahead must be a non-negative number")
-            return None, None, None
-        if look_behind < 0:
-            logging.error("look_behind must be a non-negative number")
-            return None, None, None
-        if (look_ahead + look_behind) > len(path):
-            logging.error("the path is not long enough to supply the waypoints")
-            return None, None, None
+        nearest, i, _ = self.nearest_pt(path, x, y, from_pt, num_pts)
+        # Use sequential indices without modulo arithmetic.
+        index_a = max(i - look_behind, 0)
+        index_b = min(i + look_ahead, len(path) - 1)
+        return path[index_a], nearest, path[index_b], i
 
-        _pt, i, _distance = self.nearest_pt(path, x, y, from_pt, num_pts)
-
-        # get  start of segment
-        a = (i + len(path) - look_behind) % len(path)
-
-        # get the end of the segment
-        b = (i + look_ahead) % len(path)
-
-        return a, i, b
-
-    def nearest_track(self, path, x, y, look_ahead=1, look_behind=1, from_pt=0, num_pts=None):
+    def nearest_track(self, path, x, y, look_ahead=None, look_behind=None, from_pt=0, num_pts=None):
         """
-        Get the line segment around the closest point to the given (x,y)
-        :param path: list of (x,y) points
-        :param x: horizontal coordinate of point to check
-        :param y: vertical coordinate of point to check
-        :param from_pt: index start start search within path
-        :param num_pts: maximum number of points to search in path
-        :param look_ahead: number waypoints to include ahead of nearest point.
-        :param look_behind: number of waypoints to include behind nearest point.
-        :return: start and end points of the nearest track and index of nearest point
+        Returns the segment (a, b) of the path used to compute the error.
         """
-
-        a, i, b = self.nearest_waypoints(path, x, y, look_ahead, look_behind, from_pt, num_pts)
-
-        return (path[a], path[b], i) if a is not None and b is not None else (None, None, None)
+        a, nearest, b, i = self.nearest_waypoints(path, x, y, look_ahead, look_behind, from_pt, num_pts)
+        if a is None or b is None:
+            logging.error("Unable to determine a valid track segment.")
+            return None, None, None
+        return (a, b, i)
 
     def run(self, path, x, y, from_pt=None):
         """
-        Run cross track error algorithm
-        :return: cross-track-error and index of nearest point on the path
+        Compute the cross–track error (CTE) from the current position to the path.
         """
-        cte = 0.
-        i = from_pt
-
+        cte = 0.0
         a, b, i = self.nearest_track(path, x, y, 
                                      look_ahead=self.look_ahead, look_behind=self.look_behind, 
                                      from_pt=from_pt, num_pts=self.num_pts)
         
         if a and b:
-            logging.info(f"nearest: ({a[0]}, {a[1]}) to ({x}, {y})")
-            a_v = Vec3(a[0], 0., a[1])
-            b_v = Vec3(b[0], 0., b[1])
-            p_v = Vec3(x, 0., y)
+            logging.info(f"Nearest segment: ({a[0]}, {a[1]}) to ({b[0]}, {b[1]}) for position ({x}, {y})")
+            # Create vectors for the two endpoints (assuming a flat plane with y=0 in 3D)
+            a_v = Vec3(a[0], 0.0, a[1])
+            b_v = Vec3(b[0], 0.0, b[1])
+            p_v = Vec3(x, 0.0, y)
             line = Line3D(a_v, b_v)
             err = line.vector_to(p_v)
             sign = 1.0
             cp = line.dir.cross(err.normalized())
-            if cp.y > 0.0 :
+            if cp.y > 0.0:
                 sign = -1.0
             cte = err.mag() * sign            
         else:
-            logging.info(f"no nearest point to ({x},{y}))")
+            logging.info(f"No valid nearest point found for ({x},{y})")
         return cte, i
 
+# ------------------------------
+# PID Pilot
+# ------------------------------
 
 class PID_Pilot(object):
 
-    def __init__(
-            self,
-            pid: PIDController,
-            throttle: float,
-            use_constant_throttle: bool = False,
-            min_throttle: float = None) -> None:
+    def __init__(self,
+                 pid: PIDController,
+                 throttle: float,
+                 use_constant_throttle: bool = False,
+                 min_throttle: float = None) -> None:
         self.pid = pid
         self.throttle = throttle
         self.use_constant_throttle = use_constant_throttle
